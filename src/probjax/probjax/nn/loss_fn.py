@@ -14,7 +14,13 @@ from jaxtyping import PyTree, Array
 # Flow matching objectives
 
 
-@partial(jax.jit, static_argnames=("model_fn", "mean_fn", "std_fn"))
+@partial(
+    jax.jit,
+    static_argnames=(
+        "model_fn", "mean_fn", "std_fn", "weight_fn",
+        "rebalance_loss", "axis", "score_parameterization", "estimate_score",
+    ),
+)
 def conditional_flow_and_score_matching_loss(
     params: PyTree,
     key: PRNGKey,
@@ -25,10 +31,27 @@ def conditional_flow_and_score_matching_loss(
     mean_fn: Callable,
     std_fn: Callable,
     *args,
+    loss_mask: Optional[Array] = None,
+    weight_fn: Optional[Callable] = None,
+    rebalance_loss: bool = False,
+    axis: int = -1,
+    score_parameterization: str = "raw",
     estimate_score: bool = False,
+    eps: Optional[Array] = None,
+    **kwargs,
 ):
-    """This function computes the conditional flow matching loss and score matching loss. By setting estimate_score to False, only the conditional flow matching loss is computed. By setting estimate_score to True, both the conditional flow matching loss and score matching loss are computed.
+    """Conditional flow matching loss, optionally with a co-trained score head.
 
+    By setting estimate_score to False, only the conditional flow matching
+    (velocity) loss is computed; with estimate_score=True both the velocity loss
+    and a score/denoiser loss are computed (the stochastic-interpolant dual head).
+
+    The five additions below are no-op-defaulted: with `loss_mask=None,
+    weight_fn=None, rebalance_loss=False, axis=-1, score_parameterization="raw"`
+    the result is byte-identical to the original (velocity loss
+    `mean(sum((v-u)^2, -1))`; raw score loss `mean(sum((s + eps/std)^2, -1))`).
+    They mirror `denoising_score_matching_loss` so simreturn's objectives seam can
+    drive FM-velocity (A1) and dual-head (A2) training through this one function.
 
     Args:
         params (PyTree): Parameters of the model_fn given as a PyTree.
@@ -36,29 +59,37 @@ def conditional_flow_and_score_matching_loss(
         times (Array): Time points, should be broadcastable to shape (batch_size, 1).
         xs_source (Array): Marginal distribution at time t=0, refered to as source distribution.
         xs_target (Array): Marginal distribution at time t, refered to as target distribution.
-        model_fn (Callable): Model_fn that takes parameters, times, and samples as input and returns the vector field and optionally the marginal score. Should be a function of the form model_fn(params, times, xs_t) -> v_t(, s_t).
-        mean_fn (Callable): The mean function of the Gaussian probability path, should satisfy the following:
-                                - mean_fn(xs_source, xs_target, 0) -> xs_source
-                                - mean_fn(xs_source, xs_target, 1) -> xs_target
-                                - Lipschitz continuous in time
-        std_fn (Callable): The standard deviation function of the Gaussian probability path, should satisfy the following:
-                                - std_fn(xs_source, xs_target, 0) -> 0
-                                - std_fn(xs_source, xs_target, 1) -> 0
-                                - std_fn(xs_source, xs_target, t) > 0 for all t in [0, 1]
-                                - Two times continuously differentiable in time.
+        model_fn (Callable): Model_fn that takes parameters, times, and samples as input and returns the vector field and optionally the marginal score. Should be a function of the form model_fn(params, times, xs_t, *args, **kwargs) -> v_t(, s_t).
+        mean_fn (Callable): The mean function of the Gaussian probability path (3-arg: mean_fn(xs_source, xs_target, t)).
+        std_fn (Callable): The standard deviation function of the Gaussian probability path (3-arg: std_fn(xs_source, xs_target, t)).
+        loss_mask (Optional[Array]): Conditioned-token bridge mask, broadcastable to xs_target. Where True, the token is pinned to xs_target at every t (fed clean to the model) and its residual is zeroed in BOTH the velocity and score terms. Mirrors the all-conditional DSM mask.
+        weight_fn (Optional[Callable]): Per-sample weight `weight_fn(times)` multiplying the summed residual. None => unit weight.
+        rebalance_loss (bool): If True, divide the per-sample summed loss by the count of non-masked tokens along `axis` (occupancy normalisation). Requires loss_mask.
+        axis (int): Axis to sum the residual over. simreturn passes axis=-2 (the token axis); the standalone default is -1.
+        score_parameterization (str): "raw" keeps the divergent score target -eps/std (the score head learns the marginal score directly). "denoiser" switches the score-head target to the BOUNDED eps-prediction (the head learns eta ~= E[eps|x_t]); the score is recovered analytically as s = -eta/std at inference. Only consulted when estimate_score=True.
         estimate_score (bool, optional): If set to true, both flow and score matching objectives are computed. Defaults to False.
+        eps (Optional[Array]): The path Gaussian noise. None (default) draws it from `key` (the original behaviour). When provided (e.g. a minibatch-OT-reordered source for Multisample flow matching) it is used verbatim as the bridge noise, so the (source, target) coupling carries through to both the velocity target and the score/denoiser target. Must broadcast to xs_source.shape.
 
     Returns:
         (loss_flow, Optional[loss_score]): Respective loss functions
     """
-    # Sample x_t
-    eps = jax.random.normal(key, shape=xs_source.shape)
+    # Sample x_t along the conditional Gaussian path. `eps` defaults to a fresh
+    # Gaussian draw from `key`; an externally supplied `eps` (the coupled source)
+    # overrides it without changing any other behaviour.
+    if eps is None:
+        eps = jax.random.normal(key, shape=xs_source.shape)
     xs_t = (
         mean_fn(xs_source, xs_target, times) + std_fn(xs_source, xs_target, times) * eps
     )
 
-    # Compute u_t -> For flow matching
-    # This is valid for Gaussian probability paths, which is currented here.
+    # Conditioned-token degenerate bridge: pin masked tokens to their target
+    # value at every t (they are fed clean to the model so the prediction on
+    # latent tokens is conditional on them). Their residual is zeroed below.
+    if loss_mask is not None:
+        loss_mask = loss_mask.reshape(xs_target.shape)
+        xs_t = jnp.where(loss_mask, xs_target, xs_t)
+
+    # Compute u_t -> the conditional velocity target (valid for Gaussian paths).
     t = jnp.broadcast_to(
         times, xs_target.shape
     )  # Pad to x shape for jax.grad -> x.shape
@@ -68,26 +99,34 @@ def conditional_flow_and_score_matching_loss(
         xs_source, xs_target, t
     )
 
-    # Compute loss
+    def _reduce(residual):
+        """Mask -> sum over `axis` -> weight -> rebalance -> mean. No-op for defaults."""
+        if loss_mask is not None:
+            residual = jnp.where(loss_mask, 0.0, residual)
+        out = jnp.sum(residual, axis=axis, keepdims=True)
+        if weight_fn is not None:
+            out = weight_fn(times) * out
+        if rebalance_loss and loss_mask is not None:
+            num_elements = jnp.sum(~loss_mask, axis=axis, keepdims=True)
+            out = jnp.where(num_elements > 0, out / num_elements, 0.0)
+        return jnp.mean(out)
+
     if not estimate_score:
-        # Compute vector field -> Flow matching loss
-        v_t = model_fn(params, times, xs_t, *args)
+        # Velocity-only (FM) -> the network predicts a velocity.
+        v_t = model_fn(params, times, xs_t, *args, **kwargs)
+        return _reduce((v_t - u_t) ** 2)
 
-        # Compute loss
-        loss = jnp.mean(jnp.sum((v_t - u_t) ** 2, axis=-1))
-
-        return loss
+    # Dual head -> the network predicts (velocity, score-or-denoiser).
+    v_t, s_t = model_fn(params, times, xs_t, *args, **kwargs)
+    loss = _reduce((v_t - u_t) ** 2)
+    if score_parameterization == "denoiser":
+        # Bounded eps-prediction target (the endpoint fix); s_t is eta ~= E[eps|x_t].
+        score_target = eps
     else:
-        # Compute vector field and marginal score -> Flow matching loss + Score matching loss
-        v_t, s_t = model_fn(params, times, xs_t, *args)
-
-        # Compute loss
-        loss = jnp.mean(jnp.sum((v_t - u_t) ** 2, axis=-1))
-        loss_score = jnp.mean(
-            jnp.sum((s_t + 1 / std_fn(xs_source, xs_target, times) * eps) ** 2, axis=-1)
-        )
-
-        return loss, loss_score
+        # Raw score target -eps/std (diverges as std -> 0); preserves legacy behaviour.
+        score_target = -eps / std_fn(xs_source, xs_target, times)
+    loss_score = _reduce((s_t - score_target) ** 2)
+    return loss, loss_score
 
 
 def denoising_score_matching_loss(
